@@ -3,9 +3,157 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 
+"""
+Self-Supervised Learning Meta-Architecture for DINOv3.
+
+This module implements the core training architecture for DINOv3 self-supervised
+learning, combining multiple loss functions (DINO, iBOT, KoLeo, Gram) in a
+teacher-student framework with exponential moving average (EMA) updates.
+
+Architecture Overview:
+---------------------
+::
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                         SSLMetaArch                                     │
+    │                                                                         │
+    │  ┌─────────────────┐              ┌─────────────────┐                   │
+    │  │    STUDENT      │              │    TEACHER      │                   │
+    │  │  (trainable)    │    EMA       │  (frozen, EMA)  │                   │
+    │  │                 │ ──────────>  │                 │                   │
+    │  │  ├─ backbone    │   update     │  ├─ backbone    │                   │
+    │  │  ├─ dino_head   │              │  ├─ dino_head   │                   │
+    │  │  └─ ibot_head   │              │  └─ ibot_head   │                   │
+    │  └────────┬────────┘              └────────┬────────┘                   │
+    │           │                                │                            │
+    │           ▼                                ▼                            │
+    │  ┌─────────────────────────────────────────────────────────────────┐    │
+    │  │                        LOSS COMPUTATION                         │    │
+    │  │                                                                 │    │
+    │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │    │
+    │  │  │   DINO   │  │   iBOT   │  │  KoLeo   │  │   Gram   │        │    │
+    │  │  │  (CLS)   │  │ (patch)  │  │  (reg)   │  │ (patch)  │        │    │
+    │  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │    │
+    │  │       │              │             │             │              │    │
+    │  │       └──────────────┴─────────────┴─────────────┘              │    │
+    │  │                              │                                  │    │
+    │  │                              ▼                                  │    │
+    │  │                     Total Weighted Loss                         │    │
+    │  └─────────────────────────────────────────────────────────────────┘    │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+Data Flow:
+---------
+::
+
+    Input Images
+         │
+         ▼
+    ┌─────────────────────────────────────────────────────────┐
+    │            DataAugmentationDINO (Multi-crop)            │
+    │                                                         │
+    │   ┌───────────────┐        ┌───────────────────────┐    │
+    │   │ Global Crops  │        │    Local Crops        │    │
+    │   │   (2x 224²)   │        │  (n_local x 96²)      │    │
+    │   │ + iBOT masks  │        │  (no masking)         │    │
+    │   └───────┬───────┘        └───────────┬───────────┘    │
+    └───────────┼────────────────────────────┼────────────────┘
+                │                            │
+                ▼                            ▼
+    ┌───────────────────────────────────────────────────────────┐
+    │                    Student Backbone                       │
+    │                                                           │
+    │   Global crops ──> CLS token + Patch tokens (masked)      │
+    │   Local crops  ──> CLS token + Patch tokens               │
+    └───────────────────────────────────────────────────────────┘
+                │
+                ▼
+    ┌───────────────────────────────────────────────────────────┐
+    │                    Teacher Backbone                       │
+    │                    (no gradients)                         │
+    │                                                           │
+    │   Global crops ──> CLS token + Patch tokens               │
+    │   (Sinkhorn-Knopp centering applied to outputs)           │
+    └───────────────────────────────────────────────────────────┘
+                │
+                ▼
+    ┌───────────────────────────────────────────────────────────┐
+    │                    Loss Computation                       │
+    │                                                           │
+    │   DINO Loss:  Cross-entropy on CLS tokens                 │
+    │   iBOT Loss:  Cross-entropy on masked patch tokens        │
+    │   KoLeo Loss: Uniformity regularization on CLS features   │
+    │   Gram Loss:  Feature correlation matching (optional)     │
+    └───────────────────────────────────────────────────────────┘
+
+Loss Functions:
+--------------
+1. **DINO Loss** (``dino.loss_weight``)
+   - Compares student and teacher CLS token distributions
+   - Applied to both global-global and local-global crop pairs
+   - Uses cross-entropy with soft targets from teacher
+
+2. **iBOT Loss** (``ibot.loss_weight``)
+   - Masked Image Modeling (MIM) objective
+   - Student predicts teacher's patch tokens for masked regions
+   - Only applied to global crops with random masking
+
+3. **KoLeo Loss** (``dino.koleo_loss_weight``)
+   - Uniformity regularization on feature embeddings
+   - Encourages features to span the hypersphere uniformly
+   - Can be computed locally or distributed across GPUs
+
+4. **Gram Loss** (``gram.loss_weight``, optional)
+   - Matches feature correlation matrices between student and teacher
+   - Uses a separate (possibly frozen) teacher backbone
+   - Helps preserve structural information from pretrained models
+
+Key Configuration Options:
+-------------------------
+- ``crops.local_crops_number``: Number of local crops (typically 8-10)
+- ``crops.global_crops_size``: Size of global crops (typically 224)
+- ``ibot.mask_ratio_min_max``: Range of masking ratios for iBOT
+- ``dino.head_n_prototypes``: Output dimension of DINO head (typically 65536)
+- ``gram.use_loss``: Whether to enable Gram loss regularization
+
+Usage Example:
+-------------
+.. code-block:: python
+
+    from dinov3.train.ssl_meta_arch import SSLMetaArch
+    from omegaconf import OmegaConf
+
+    # Load configuration
+    cfg = OmegaConf.load("dinov3/configs/train/vitl_im1k_lin834.yaml")
+
+    # Build meta-architecture
+    model = SSLMetaArch(cfg)
+    model.init_weights()
+    model.prepare_for_distributed_training()
+
+    # Training loop
+    for data in dataloader:
+        loss, metrics = model.forward_backward(
+            data,
+            teacher_temp=0.04,
+            iteration=step,
+        )
+        optimizer.step()
+        model.update_ema(momentum=0.996)
+
+See Also:
+--------
+- ``dinov3/train/multidist_meta_arch.py``: Multi-student distillation variant
+- ``dinov3/loss/``: Individual loss function implementations
+- ``dinov3/models/``: Backbone model definitions (ViT variants)
+"""
+
+from __future__ import annotations
+
 import gc
 import logging
 from functools import partial
+from typing import TYPE_CHECKING, Any
 
 import torch
 from omegaconf import OmegaConf
@@ -23,18 +171,152 @@ from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
 
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
 logger = logging.getLogger("dinov3")
+
+
+# ==============================================================================
+
+
+# ==============================================================================
 
 
 class SSLMetaArch(nn.Module):
     """
-    Modified version of SSLMetaArchCompilable including gram loss:
-    - Gram loss is used only if gram.use_loss is set to true
+    Self-Supervised Learning Meta-Architecture for DINOv3 pretraining.
+
+    This class orchestrates the complete DINOv3 training pipeline, including:
+
+    - Student and teacher network management (with EMA updates)
+    - Multi-crop data augmentation coordination
+    - Forward pass through student and teacher networks
+    - Loss computation (DINO + iBOT + KoLeo + optional Gram)
+    - Backward pass and gradient accumulation
+
+    The architecture follows the teacher-student paradigm where:
+
+    1. **Student**: Trained with gradients, processes masked global crops and local crops
+    2. **Teacher**: Frozen copy updated via EMA, provides soft targets
+    3. **Gram Teacher** (optional): Separate frozen backbone for Gram loss
+
+    Attributes:
+    ----------
+    cfg : DictConfig
+        Complete OmegaConf configuration object.
+
+    student : nn.ModuleDict
+        Trainable student model containing:
+        - ``backbone``: Vision Transformer backbone
+        - ``dino_head``: Projection head for DINO loss (CLS token)
+        - ``ibot_head``: Projection head for iBOT loss (patch tokens)
+
+    teacher : nn.ModuleDict
+        Frozen teacher model (same structure as student).
+        Updated via EMA in :meth:`update_ema`.
+
+    model_ema : nn.ModuleDict
+        Alias to teacher (or distillation teacher if enabled).
+        This is the model used for EMA target generation.
+
+    gram_teacher : nn.ModuleDict | None
+        Optional separate teacher for Gram loss.
+        Only created if ``cfg.gram.use_loss=True`` and ``cfg.gram.ema_teacher=False``.
+
+    dino_loss : DINOLoss
+        DINO loss module with Sinkhorn-Knopp centering.
+
+    ibot_patch_loss : iBOTPatchLoss
+        iBOT masked patch prediction loss.
+
+    koleo_loss : KoLeoLoss | KoLeoLossDistributed
+        Uniformity regularization loss.
+
+    gram_loss : GramLoss | None
+        Optional Gram matrix matching loss.
+
+    embed_dim : int
+        Embedding dimension of the backbone (D).
+
+    dino_out_dim : int
+        Output dimension of DINO head (K, number of prototypes).
+
+    Example:
+    -------
+    .. code-block:: python
+
+        # Standard DINOv3 pretraining setup
+        model = SSLMetaArch(cfg)
+        model.init_weights()  # Initialize or load pretrained weights
+        model.prepare_for_distributed_training()  # Apply FSDP wrapping
+
+        # Build optimizer on student parameters only
+        optimizer = torch.optim.AdamW(model.get_params_groups())
+
+        # Training step
+        loss, metrics = model.forward_backward(
+            data=batch,
+            teacher_temp=0.04,
+            iteration=current_iteration,
+        )
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # Update teacher via EMA
+        model.update_ema(m=0.996)  # m is momentum, higher = slower update
+
+    Note:
+    ----
+    This class assumes FSDP (Fully Sharded Data Parallel) training with
+    the ``SHARD_GRAD_OP`` sharding strategy. The ``prepare_for_distributed_training``
+    method must be called before training to apply FSDP wrapping.
+
+    See Also:
+    --------
+    - :class:`MultiDistillationMetaArch`: For multi-student knowledge distillation
+    - :func:`build_model_from_cfg`: Backbone construction utility
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg: DictConfig) -> None:
+        """
+        Initialize the SSL Meta-Architecture.
+
+        Constructs student, teacher, and optional gram teacher networks along
+        with all loss modules. Does NOT initialize weights - call :meth:`init_weights`
+        after construction.
+
+        Parameters:
+        ----------
+        cfg : DictConfig
+            Complete configuration object. Key sections:
+
+            - ``student``: Backbone architecture (arch, patch_size, etc.)
+            - ``crops``: Data augmentation settings
+            - ``dino``: DINO loss configuration
+            - ``ibot``: iBOT loss configuration
+            - ``gram``: Gram loss configuration (optional)
+            - ``distillation``: Knowledge distillation settings
+            - ``optim``: Optimizer and scheduler settings
+            - ``train``: Training loop settings
+
+        Raises:
+        ------
+        AssertionError
+            If configuration constraints are violated:
+            - ``crops.local_crops_number`` must be > 0
+            - ``ibot.separate_head`` must be True
+            - ``train.centering`` must be "sinkhorn_knopp"
+            - ``compute_precision.sharding_strategy`` must be "SHARD_GRAD_OP"
+
+        ValueError
+            If Gram loss configuration is inconsistent.
+        """
         super().__init__()
 
+        # ==========================================================================
+        # Configuration Validation
+        # ==========================================================================
         # assert cfg.multidistillation.enabled is False
         assert cfg.crops.local_crops_number > 0
         assert cfg.ibot.separate_head is True
@@ -89,9 +371,9 @@ class SSLMetaArch(nn.Module):
             logger.info(
                 f"OPTIONS -- KOLEO -- distributed_loss_group_size: {cfg.dino.koleo_distributed_loss_group_size}"
             )
-            assert cfg.dino.koleo_distributed_replicas == 0, (
-                "Option `dino.koleo_distributed_replicas` is no longer supported"
-            )
+            assert (
+                cfg.dino.koleo_distributed_replicas == 0
+            ), "Option `dino.koleo_distributed_replicas` is no longer supported"
             self.koleo_loss = KoLeoLossDistributed(
                 topk=cfg.dino.koleo_topk,
                 loss_group_size=cfg.dino.koleo_distributed_loss_group_size,
@@ -105,9 +387,9 @@ class SSLMetaArch(nn.Module):
         logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_ratio_tuple: {cfg.ibot.mask_ratio_min_max}")
         logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_sample_probability: {cfg.ibot.mask_sample_probability}")
 
-        assert 0 <= cfg.ibot.mask_ratio_min_max[0] < cfg.ibot.mask_ratio_min_max[1] <= 1, (
-            "provide a valid cfg.ibot.mask_ratio_min_max"
-        )
+        assert (
+            0 <= cfg.ibot.mask_ratio_min_max[0] < cfg.ibot.mask_ratio_min_max[1] <= 1
+        ), "provide a valid cfg.ibot.mask_ratio_min_max"
         assert 0 <= cfg.ibot.mask_sample_probability <= 1, "provide a positive mask probability for ibot"
         logger.info(f"OPTIONS -- IBOT -- head_n_prototypes: {cfg.ibot.head_n_prototypes}")
         logger.info(f"OPTIONS -- IBOT -- head_bottleneck_dim: {cfg.ibot.head_bottleneck_dim}")
@@ -260,7 +542,22 @@ class SSLMetaArch(nn.Module):
                 f"OPTIONS -- global crops GRAM teacher resize antialias: {cfg.gram.global_teacher_resize_antialias}"
             )
 
-    def _setup_distillation(self):
+    def _setup_distillation(self) -> None:
+        """
+        Set up knowledge distillation from a larger teacher model.
+
+        When ``cfg.distillation.enabled=True``, this method replaces the default
+        teacher (EMA copy of student) with a separate, potentially larger model
+        loaded from a different configuration and checkpoint.
+
+        The distillation teacher:
+        - Uses its own architecture (can be different size than student)
+        - Is loaded from ``cfg.distillation.checkpoint_path``
+        - Remains frozen during training
+        - Must have matching head dimensions (prototypes) with student
+
+        This enables training a smaller student to mimic a larger pretrained teacher.
+        """
         logger.info(f"Performing distillation from {self.cfg.distillation.full_cfg_path}")
 
         default_cfg = get_default_config()
@@ -268,12 +565,12 @@ class SSLMetaArch(nn.Module):
         distillation_cfg = OmegaConf.merge(default_cfg, distillation_cfg)
 
         assert distillation_cfg.ibot.separate_head is True
-        assert distillation_cfg.ibot.head_n_prototypes == self.cfg.ibot.head_n_prototypes, (
-            f"{distillation_cfg.ibot.head_n_prototypes} != {self.cfg.ibot.head_n_prototypes}"
-        )
-        assert distillation_cfg.dino.head_n_prototypes == self.cfg.dino.head_n_prototypes, (
-            f"{distillation_cfg.dino.head_n_prototypes} != {self.cfg.dino.head_n_prototypes}"
-        )
+        assert (
+            distillation_cfg.ibot.head_n_prototypes == self.cfg.ibot.head_n_prototypes
+        ), f"{distillation_cfg.ibot.head_n_prototypes} != {self.cfg.ibot.head_n_prototypes}"
+        assert (
+            distillation_cfg.dino.head_n_prototypes == self.cfg.dino.head_n_prototypes
+        ), f"{distillation_cfg.dino.head_n_prototypes} != {self.cfg.dino.head_n_prototypes}"
         assert distillation_cfg.student.patch_size == self.cfg.student.patch_size
 
         teacher_model_dict = dict()
@@ -298,6 +595,32 @@ class SSLMetaArch(nn.Module):
         self.teacher = nn.ModuleDict(teacher_model_dict)
 
     def init_weights(self) -> None:
+        """
+        Initialize all model weights.
+
+        This method handles the complete weight initialization pipeline:
+
+        1. **Student initialization**: Backbone, DINO head, and iBOT head
+        2. **Loss module initialization**: DINO and iBOT centering buffers
+        3. **Teacher synchronization**: Copy student weights to EMA teacher
+        4. **Gram teacher loading**: Load from checkpoint if configured
+        5. **Resume from checkpoint**: Optionally load pretrained student weights
+        6. **Distillation teacher loading**: Load teacher for knowledge distillation
+
+        Must be called after :meth:`__init__` and before training.
+
+        Note:
+        ----
+        Weights are initially set to NaN in ``build_model_from_cfg`` using
+        ``torch.device("meta")``. This ensures all parameters are explicitly
+        initialized and catches any uninitialized weights.
+
+        Raises:
+        ------
+        ValueError
+            If ``gram.use_loss=True`` but no checkpoint path is provided
+            and ``gram.it_load_ema_teacher`` is not set.
+        """
         # All weights are set to `nan` to ensure we initialize everything explicitly
         self.student.backbone.init_weights()
         self.student.dino_head.init_weights()
@@ -353,8 +676,84 @@ class SSLMetaArch(nn.Module):
             logger.info(f"Performing distillation from: {self.teacher}")
 
     def forward_backward(
-        self, data, *, teacher_temp, iteration=0, **ignored_kwargs
+        self,
+        data: dict[str, Any],
+        *,
+        teacher_temp: float,
+        iteration: int = 0,
+        **ignored_kwargs: Any,
     ) -> tuple[Tensor, dict[str, float | Tensor]]:
+        """
+        Execute complete forward and backward pass for one training step.
+
+        This is the main training method that:
+
+        1. Moves data to GPU
+        2. Computes teacher outputs (no gradients)
+        3. Computes student outputs (with gradients)
+        4. Computes all losses (DINO, iBOT, KoLeo, Gram)
+        5. Executes backward pass
+
+        Parameters:
+        ----------
+        data : dict[str, Any]
+            Batch from the data loader containing:
+
+            - ``collated_global_crops``: [2*B, 3, H, W] global crop images
+            - ``collated_local_crops``: [n_local*B, 3, h, w] local crop images
+            - ``collated_masks``: [2*B, P] boolean masks for iBOT
+            - ``mask_indices_list``: [N] indices of masked patches
+            - ``masks_weight``: [N] importance weights for masked patches
+            - ``n_masked_patches``: [2*B] number of masked patches per image
+            - ``collated_gram_teacher_crops``: (optional) crops for gram teacher
+            - ``global_batch_size``: Total batch size across all ranks
+            - ``upperbound``: Upper bound for various computations
+
+        teacher_temp : float
+            Temperature for teacher softmax. Lower = sharper distributions.
+            Typically starts at 0.04 and may warm up to 0.07.
+
+        iteration : int, default=0
+            Current training iteration. Used for:
+            - Loss weight scheduling (e.g., Gram loss warmup)
+            - DINO local loss reweighting schedule
+
+        **ignored_kwargs : Any
+            Additional keyword arguments (ignored for compatibility).
+
+        Returns:
+        -------
+        tuple[Tensor, dict[str, float | Tensor]]
+            - ``loss_accumulator``: Scalar tensor with total weighted loss
+            - ``metrics_dict``: Dictionary of individual losses and metrics for logging:
+              - ``local_batch_size``: Per-GPU batch size
+              - ``global_batch_size``: Total batch size
+              - ``dino_local_crops_loss``: DINO loss on local crops
+              - ``dino_global_crops_loss``: DINO loss on global crops
+              - ``koleo_loss``: KoLeo uniformity loss
+              - ``ibot_loss``: iBOT masked patch loss
+              - ``gram_loss``: (if enabled) Gram matrix loss
+              - Various loss weights and auxiliary statistics
+
+        Note:
+        ----
+        This method calls ``loss.backward()`` internally. The optimizer
+        step should be called after this method returns.
+
+        Example:
+        -------
+        .. code-block:: python
+
+            for data in dataloader:
+                loss, metrics = model.forward_backward(
+                    data,
+                    teacher_temp=0.04,
+                    iteration=step,
+                )
+                optimizer.step()
+                optimizer.zero_grad()
+                model.update_ema(m=ema_schedule[step])
+        """
         del ignored_kwargs
         metrics_dict = {}
 
@@ -374,9 +773,9 @@ class SSLMetaArch(nn.Module):
         n_masked_patches_tensor = data["n_masked_patches"].cuda(non_blocking=True)
 
         if self.has_gram_teacher:
-            assert "collated_gram_teacher_crops" in data, (
-                "no gram teacher crops in the data, have you set cfg.crops.gram_teacher_crops_size?"
-            )
+            assert (
+                "collated_gram_teacher_crops" in data
+            ), "no gram teacher crops in the data, have you set cfg.crops.gram_teacher_crops_size?"
             gram_teacher_crops = data["collated_gram_teacher_crops"].cuda(non_blocking=True)
         else:
             gram_teacher_crops = None
@@ -431,13 +830,54 @@ class SSLMetaArch(nn.Module):
     @torch.no_grad()
     def get_teacher_output(
         self,
-        images,
+        images: Tensor,
         *,
-        upperbound,
-        mask_indices_list,
-        teacher_temp,
-        n_masked_patches_tensor,
-    ):
+        upperbound: int,
+        mask_indices_list: Tensor,
+        teacher_temp: float,
+        n_masked_patches_tensor: Tensor,
+    ) -> dict[str, Tensor]:
+        """
+        Compute teacher outputs for global crops (no gradients).
+
+        The teacher processes global crops and produces:
+        - CLS tokens for DINO loss
+        - Patch tokens for iBOT loss (only at masked positions)
+
+        Outputs are centered using Sinkhorn-Knopp normalization to prevent
+        collapse and ensure balanced prototype usage.
+
+        Parameters:
+        ----------
+        images : Tensor
+            Global crop images, shape [n_crops, B, 3, H, W].
+            Typically n_crops=2 for two global views.
+
+        upperbound : int
+            Upper bound for computation (used internally).
+
+        mask_indices_list : Tensor
+            Flat indices of masked patches across all images.
+            Shape [N] where N is total number of masked patches.
+
+        teacher_temp : float
+            Temperature for Sinkhorn-Knopp centering.
+
+        n_masked_patches_tensor : Tensor
+            Number of masked patches per image, shape [n_crops * B].
+
+        Returns:
+        -------
+        dict[str, Tensor]
+            Teacher outputs:
+
+            - ``cls_pre_head``: [n_crops, B, D] CLS tokens before projection
+            - ``reg_pre_head``: [n_crops, B, R, D] Register tokens
+            - ``patch_pre_head``: [n_crops, B, P, D] All patch tokens
+            - ``cls_after_head``: [n_crops, B, K] CLS after DINO head
+            - ``cls_centered``: [n_crops, B, K] Sinkhorn-centered CLS
+            - ``masked_patch_centered``: [N, K] Centered masked patch tokens
+        """
         n_crops, B, rgb, H, W = images.shape
         images = images.flatten(0, 1)
 
@@ -473,7 +913,63 @@ class SSLMetaArch(nn.Module):
             "masked_patch_centered": masked_patch_centered,  # [n_masked_patches, K]
         }
 
-    def get_gram_teacher_output(self, images, *, masks, teacher_global, student_global, student_global_crops_size):
+    def get_gram_teacher_output(
+        self,
+        images: Tensor | None,
+        *,
+        masks: Tensor,
+        teacher_global: dict[str, Tensor],
+        student_global: dict[str, Tensor],
+        student_global_crops_size: int,
+    ) -> dict[str, Tensor]:
+        """
+        Compute Gram teacher outputs for Gram loss computation.
+
+        The Gram loss compares feature correlation matrices (Gram matrices)
+        between student and a reference teacher. The teacher can be:
+
+        1. **EMA teacher** (``gram.ema_teacher=True``): Uses the same teacher
+           as DINO/iBOT losses. No separate forward pass needed.
+
+        2. **Separate teacher** (``gram.ema_teacher=False``): Uses a dedicated
+           frozen backbone, possibly with different resolution or architecture.
+
+        Parameters:
+        ----------
+        images : Tensor | None
+            Gram teacher input crops, shape [n_crops, B, 3, H', W'].
+            Can be different resolution than student crops.
+            None if using EMA teacher.
+
+        masks : Tensor
+            Boolean mask indicating which patches are masked for iBOT.
+            Shape [n_crops * B, P].
+
+        teacher_global : dict[str, Tensor]
+            Outputs from :meth:`get_teacher_output` (used if EMA teacher).
+
+        student_global : dict[str, Tensor]
+            Outputs from :meth:`get_student_output`.
+
+        student_global_crops_size : int
+            Spatial size of student global crops (e.g., 224).
+
+        Returns:
+        -------
+        dict[str, Tensor]
+            Gram computation inputs:
+
+            - ``student_patches``: Student features for Gram loss
+            - ``teacher_patches``: Teacher features for Gram loss
+            - ``orig_student_patches``: All student patches (for stats)
+            - ``orig_teacher_patches``: All teacher patches (for stats)
+
+        Note:
+        ----
+        If teacher has different resolution, features are interpolated
+        to match student resolution using the configured method
+        (``gram.global_teacher_resize_method``).
+        """
         # Get student patch features
         student_patches = student_global["patch_pre_head"].flatten(0, 1)  # [n_crops * B, P, D]
 
@@ -527,7 +1023,57 @@ class SSLMetaArch(nn.Module):
             "orig_teacher_patches": orig_teacher_patches,  # [n_crops * B, P, D]
         }
 
-    def get_student_output(self, *, global_crops, local_crops, upperbound, masks, mask_indices_list):
+    def get_student_output(
+        self,
+        *,
+        global_crops: Tensor,
+        local_crops: Tensor,
+        upperbound: int,
+        masks: Tensor,
+        mask_indices_list: Tensor,
+    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        """
+        Compute student outputs for both global and local crops.
+
+        The student processes:
+        - **Global crops** with iBOT masking: Some patches are masked and
+          the student must predict their teacher representations
+        - **Local crops** without masking: Only DINO loss on CLS tokens
+
+        Both crop types share the same backbone forward pass for efficiency.
+
+        Parameters:
+        ----------
+        global_crops : Tensor
+            Global view images, shape [n_global, B, 3, H, W].
+
+        local_crops : Tensor
+            Local view images, shape [n_local, B, 3, h, w].
+
+        upperbound : int
+            Upper bound for computation.
+
+        masks : Tensor
+            Boolean masks for iBOT, shape [n_global * B, P].
+            True = masked (student must predict these).
+
+        mask_indices_list : Tensor
+            Flat indices of masked patches, shape [N].
+
+        Returns:
+        -------
+        tuple[dict[str, Tensor], dict[str, Tensor]]
+            - ``global_out``: Global crop outputs with keys:
+              - ``cls_pre_head``: [n_global, B, D]
+              - ``cls_after_head``: [n_global, B, K]
+              - ``patch_pre_head``: [n_global, B, P, D]
+              - ``masked_patch_after_head``: [N, K] (for iBOT)
+              - ``masked_patch_pre_head``: [N, D]
+            - ``local_out``: Local crop outputs with keys:
+              - ``cls_pre_head``: [n_local, B, D]
+              - ``cls_after_head``: [n_local, B, K]
+              - ``patch_pre_head``: [n_local, B, P, D]
+        """
         n_global_crops, B, rgb, H, W = global_crops.shape
         n_local_crops, B, rgb, H, W = local_crops.shape
 
@@ -584,15 +1130,66 @@ class SSLMetaArch(nn.Module):
     def compute_losses(
         self,
         *,
-        teacher_global,
-        student_global,
-        student_local,
-        gram_global,
-        masks,
-        mask_indices_list,
-        masks_weight,
-        iteration,
-    ):
+        teacher_global: dict[str, Tensor],
+        student_global: dict[str, Tensor],
+        student_local: dict[str, Tensor],
+        gram_global: dict[str, Tensor],
+        masks: Tensor,
+        mask_indices_list: Tensor,
+        masks_weight: Tensor,
+        iteration: int,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """
+        Compute all loss terms and return weighted sum.
+
+        Loss Components:
+        ---------------
+        1. **DINO Global Loss**: Student global CLS vs Teacher global CLS
+        2. **DINO Local Loss**: Student local CLS vs Teacher global CLS
+        3. **KoLeo Loss**: Uniformity regularization on student CLS features
+        4. **iBOT Loss**: Masked patch prediction (student vs teacher)
+        5. **Gram Loss** (optional): Feature correlation matching
+
+        Loss Scaling:
+        ------------
+        DINO losses are scaled by the relative number of cross-entropy terms:
+        - Global scale = n_global_terms / total_terms
+        - Local scale = n_local_terms / total_terms
+
+        This ensures equal per-term contribution regardless of crop counts.
+
+        Parameters:
+        ----------
+        teacher_global : dict[str, Tensor]
+            Teacher outputs from :meth:`get_teacher_output`.
+
+        student_global : dict[str, Tensor]
+            Student global crop outputs from :meth:`get_student_output`.
+
+        student_local : dict[str, Tensor]
+            Student local crop outputs from :meth:`get_student_output`.
+
+        gram_global : dict[str, Tensor]
+            Gram loss inputs from :meth:`get_gram_teacher_output`.
+
+        masks : Tensor
+            iBOT masks, shape [n_global * B, P].
+
+        mask_indices_list : Tensor
+            Indices of masked patches.
+
+        masks_weight : Tensor
+            Importance weights for masked patches.
+
+        iteration : int
+            Current iteration (for scheduled loss weights).
+
+        Returns:
+        -------
+        tuple[Tensor, dict[str, Tensor]]
+            - ``loss_accumulator``: Total weighted loss (scalar)
+            - ``loss_dict``: Individual losses for logging
+        """
         n_global_crops = student_global["cls_after_head"].shape[0]
         n_local_crops = student_local["cls_after_head"].shape[0]
         loss_dict = {}
@@ -684,7 +1281,16 @@ class SSLMetaArch(nn.Module):
         return loss_accumulator, loss_dict
 
     @torch.no_grad()
-    def gram_load_ema_teacher(self):
+    def gram_load_ema_teacher(self) -> None:
+        """
+        Load EMA teacher weights into the Gram teacher backbone.
+
+        This is used when ``gram.it_load_ema_teacher`` is set, allowing
+        the Gram teacher to be initialized from the EMA teacher after
+        some training iterations rather than from a checkpoint.
+
+        Only copies backbone weights; DINO and iBOT heads are skipped.
+        """
         if self.has_gram_teacher:
             skip_load_prefixes = ["dino_head.", "ibot_head."]
             self.gram_teacher.load_state_dict(
@@ -698,19 +1304,80 @@ class SSLMetaArch(nn.Module):
             self.gram_teacher.eval()
             self.gram_teacher_initialized = True
 
-    def train(self):
+    def train(self) -> None:
+        """
+        Set model to training mode.
+
+        Overrides ``nn.Module.train()`` to ensure teacher networks
+        remain in eval mode (frozen, no dropout/batchnorm updates).
+        """
         super().train()
         self.teacher.eval()
         if self.has_gram_teacher:
             self.gram_teacher.eval()
 
-    def forward(self, inputs):
+    def forward(self, inputs: Any) -> None:
+        """
+        Standard forward pass (not implemented).
+
+        Use :meth:`forward_backward` instead for training.
+        This method exists only for nn.Module compatibility.
+
+        Raises:
+        ------
+        NotImplementedError
+            Always raised. Use ``forward_backward`` for training.
+        """
         raise NotImplementedError
 
-    def backprop_loss(self, loss):
+    def backprop_loss(self, loss: Tensor) -> None:
+        """
+        Execute backward pass on the loss.
+
+        Parameters:
+        ----------
+        loss : Tensor
+            Scalar loss tensor to backpropagate.
+
+        Note:
+        ----
+        This is a simple wrapper that can be overridden for custom
+        gradient handling (e.g., gradient scaling, clipping).
+        """
         loss.backward()
 
-    def update_ema(self, m):
+    def update_ema(self, m: float) -> None:
+        """
+        Update teacher weights via Exponential Moving Average.
+
+        The update rule is:
+        ``teacher = m * teacher + (1 - m) * student``
+
+        Parameters:
+        ----------
+        m : float
+            EMA momentum/decay factor in [0, 1].
+            Higher values = slower teacher updates.
+
+            - ``m=0.0``: Teacher becomes exact copy of student
+            - ``m=0.99``: Teacher updated with 1% of student weights
+            - ``m=0.999``: Teacher updated with 0.1% of student weights
+
+        Note:
+        ----
+        Uses ``torch._foreach_*`` operations for efficient batched
+        parameter updates. Parameter lists are cached after first call.
+
+        Example:
+        -------
+        Typical momentum schedule starts at 0.996 and increases to 0.9999:
+
+        .. code-block:: python
+
+            # Linear warmup of momentum
+            ema_momentum = 0.996 + (0.9999 - 0.996) * min(1, step / warmup_steps)
+            model.update_ema(ema_momentum)
+        """
         if self.ema_params_lists is None:
             student_param_list = []
             teacher_param_list = []
@@ -725,7 +1392,23 @@ class SSLMetaArch(nn.Module):
             torch._foreach_mul_(teacher_param_list, m)
             torch._foreach_add_(teacher_param_list, student_param_list, alpha=1 - m)
 
-    def update_gram(self, m=0):
+    def update_gram(self, m: float = 0) -> None:
+        """
+        Update Gram teacher weights from the main teacher.
+
+        Used when ``gram.rep_update=True`` to periodically refresh
+        the Gram teacher backbone from the EMA teacher.
+
+        Parameters:
+        ----------
+        m : float, default=0
+            EMA momentum (0 = complete replacement with teacher weights).
+
+        Note:
+        ----
+        Only called if ``gram.rep_update=True`` and iteration >
+        ``gram.it_first_update`` at frequency ``gram.update_frequency``.
+        """
         if not self.has_gram_teacher:
             return
         logger.info("Updating gram teacher with teacher weights.")
@@ -744,7 +1427,24 @@ class SSLMetaArch(nn.Module):
             torch._foreach_mul_(gramteacher_param_list, m)
             torch._foreach_add_(gramteacher_param_list, teacher_param_list, alpha=1 - m)
 
-    def build_data_augmentation_dino(self, cfg):
+    def build_data_augmentation_dino(self, cfg: DictConfig) -> DataAugmentationDINO:
+        """
+        Build the DINO data augmentation pipeline.
+
+        Creates a ``DataAugmentationDINO`` instance configured for multi-crop
+        training with global and local views, color jittering, and optional
+        Gram teacher crops.
+
+        Parameters:
+        ----------
+        cfg : DictConfig
+            Configuration object with ``crops`` section.
+
+        Returns:
+        -------
+        DataAugmentationDINO
+            Configured augmentation pipeline for training.
+        """
         return DataAugmentationDINO(
             cfg.crops.global_crops_scale,
             cfg.crops.local_crops_scale,
@@ -760,7 +1460,28 @@ class SSLMetaArch(nn.Module):
             std=cfg.crops.rgb_std,
         )
 
-    def get_maybe_fused_params_for_submodel(self, m: nn.Module):
+    def get_maybe_fused_params_for_submodel(self, m: nn.Module) -> list[dict[str, Any]]:
+        """
+        Get parameter groups for a submodel with optional fusion.
+
+        Creates parameter groups with:
+        - Layer-wise learning rate decay
+        - Special learning rate for patch embedding
+        - Custom weight decay for DINO head
+
+        Optionally fuses parameter groups for more efficient optimizer
+        operations (``cfg.optim.multi_tensor_optim=True``).
+
+        Parameters:
+        ----------
+        m : nn.Module
+            Submodel (e.g., backbone, dino_head, ibot_head).
+
+        Returns:
+        -------
+        list[dict[str, Any]]
+            List of parameter group dicts for optimizer construction.
+        """
         params_groups = get_params_groups_with_decay_fsdp(
             model=m,
             lr_decay_rate=self.cfg.optim.layerwise_decay,
@@ -778,7 +1499,27 @@ class SSLMetaArch(nn.Module):
         else:
             return params_groups
 
-    def get_params_groups(self):
+    def get_params_groups(self) -> list[dict[str, Any]]:
+        """
+        Get all parameter groups for optimizer construction.
+
+        Collects parameter groups from all student submodels (backbone,
+        dino_head, ibot_head) with appropriate learning rate and weight
+        decay settings.
+
+        Returns:
+        -------
+        list[dict[str, Any]]
+            Combined parameter groups for all student components.
+            Ready to pass to optimizer constructor.
+
+        Example:
+        -------
+        .. code-block:: python
+
+            param_groups = model.get_params_groups()
+            optimizer = torch.optim.AdamW(param_groups, lr=base_lr)
+        """
         all_params_groups = []
         for name, m in self.student.items():
             logger.info(f"Getting paramer groups for {name}")
@@ -786,6 +1527,27 @@ class SSLMetaArch(nn.Module):
         return all_params_groups
 
     def prepare_for_distributed_training(self) -> None:
+        """
+        Apply FSDP wrapping and compilation for distributed training.
+
+        This method:
+
+        1. Wraps student model with FSDP for gradient sharding
+        2. Wraps teacher models for inference-only FSDP
+        3. Optionally applies ``torch.compile`` for optimization
+        4. Applies activation checkpointing if configured
+
+        Must be called after :meth:`init_weights` and before training.
+
+        Note:
+        ----
+        Uses different process groups for different models:
+
+        - Student: Uses process subgroup (for gradient accumulation)
+        - EMA Teacher: Uses process subgroup (mirrors student)
+        - Gram Teacher: Uses default process group
+        - Distillation Teacher: Uses default process group
+        """
         process_subgroup = distributed.get_process_subgroup()
         default_process_group = distributed.get_default_process_group()
         inference_only_models = [self.model_ema]
@@ -804,9 +1566,35 @@ class SSLMetaArch(nn.Module):
             inference_only_models_process_groups=inference_only_models_process_groups,
         )
 
-    def broadcast_to_subgroups(self, tensor, over_dim, global_batch_size=None):
+    def broadcast_to_subgroups(
+        self,
+        tensor: Tensor,
+        over_dim: int,
+        global_batch_size: int | None = None,
+    ) -> Tensor:
         """
-        This is an operation that takes a tensor from the default process group, gathers it, stacks it, then scatters it within a smaller process subgroup
+        Gather tensor globally then scatter to process subgroups.
+
+        This operation enables communication patterns where data from all
+        ranks needs to be redistributed to smaller process subgroups
+        (e.g., for gradient accumulation across subsets of GPUs).
+
+        Parameters:
+        ----------
+        tensor : Tensor
+            Input tensor to broadcast.
+
+        over_dim : int
+            Dimension along which to concatenate gathered tensors.
+
+        global_batch_size : int | None, optional
+            If provided, truncate gathered tensor to this size along
+            ``over_dim`` (handles uneven batch distribution).
+
+        Returns:
+        -------
+        Tensor
+            Redistributed tensor for the current process subgroup.
         """
         world_size = distributed.get_world_size()
         subgroup_size = distributed.get_subgroup_size()
