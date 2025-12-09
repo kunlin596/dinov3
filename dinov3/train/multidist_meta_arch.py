@@ -3,6 +3,94 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 
+"""
+Multi-Student Knowledge Distillation Meta-Architecture.
+
+This module implements the ``MultiDistillationMetaArch`` class for training multiple
+student models simultaneously from a shared teacher. Each student runs on a subset
+of GPUs (process subgroup) while sharing teacher outputs via broadcast.
+
+Architecture Overview:
+---------------------
+::
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                      Multi-Distillation Training                        │
+    │                                                                         │
+    │   ┌─────────────────────────────────────────────────────────────────┐   │
+    │   │                    Shared Teacher (Frozen)                      │   │
+    │   │                                                                 │   │
+    │   │   Global Crops ──► Teacher Backbone ──► DINO/iBOT Heads         │   │
+    │   │        │                                      │                 │   │
+    │   │        │              ┌───────────────────────┘                 │   │
+    │   │        │              ▼                                         │   │
+    │   │        │     broadcast_to_subgroups()                           │   │
+    │   │        │              │                                         │   │
+    │   └────────┼──────────────┼─────────────────────────────────────────┘   │
+    │            │              │                                             │
+    │   ┌────────┼──────────────┼─────────────────────────────────────────┐   │
+    │   │        ▼              ▼                                         │   │
+    │   │   ┌─────────┐   ┌─────────┐   ┌─────────┐                       │   │
+    │   │   │Student A│   │Student B│   │Student C│  (different archs)    │   │
+    │   │   │(ranks   │   │(ranks   │   │(ranks   │                       │   │
+    │   │   │ 0-3)    │   │ 4-5)    │   │ 6-7)    │                       │   │
+    │   │   └────┬────┘   └────┬────┘   └────┬────┘                       │   │
+    │   │        │             │             │                            │   │
+    │   │        ▼             ▼             ▼                            │   │
+    │   │   ┌─────────────────────────────────────┐                       │   │
+    │   │   │     DINO + iBOT + KoLeo Losses      │                       │   │
+    │   │   │   (computed per student subgroup)   │                       │   │
+    │   │   └─────────────────────────────────────┘                       │   │
+    │   └─────────────────────────────────────────────────────────────────┘   │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+Key Differences from Standard SSLMetaArch:
+-----------------------------------------
+1. **Subgroup Broadcasting**: Teacher outputs are broadcast to student subgroups
+   rather than computed per-rank.
+
+2. **Resolution Scaling**: Teacher crops can be downsampled to match student
+   resolution (for training smaller students from larger teacher features).
+
+3. **Simplified Configuration**: Fixed settings for losses (DINO, iBOT, KoLeo
+   always computed), centering (Sinkhorn-Knopp), and crop types (global + local).
+
+4. **No Gram Loss**: Multi-distillation focuses on knowledge transfer, not
+   late-stage feature anchoring.
+
+Usage Example:
+-------------
+Multi-distillation is typically configured via YAML:
+
+.. code-block:: yaml
+
+    # multidist_config.yaml
+    multidistillation:
+      enabled: true
+      global_batch_size: 512
+      students:
+        - name: vits_student
+          config_path: configs/train/vits_student.yaml
+          ranks_range: [0, 4]  # GPUs 0-3
+        - name: vitb_student
+          config_path: configs/train/vitb_student.yaml
+          ranks_range: [4, 8]  # GPUs 4-7
+
+Then launched with:
+
+.. code-block:: bash
+
+    python scripts/dinov3_cli.py distill --config-file multidist_config.yaml
+
+See Also:
+--------
+- :class:`SSLMetaArch`: Base class with full DINO/iBOT/Gram implementation
+- :func:`setup_multidistillation`: Configuration setup for multi-distillation
+- ``04_knowledge_distillation.md``: Tutorial on distillation workflows
+"""
+
+from __future__ import annotations
+
 import logging
 
 import torch
@@ -15,18 +103,90 @@ logger = logging.getLogger("dinov3")
 
 class MultiDistillationMetaArch(SSLMetaArch):
     """
-    Multidistillation version of SSLMetaArchCompilableGram:
-    - baked-in scales for DINO, KOLEO, and IBOT losses
-    - always global and local crops
-    - always separate heads for DINO and IBOT
-    - always sinkhorn-knopp centering for DINO and IBOT
-    - always per-GPU computation of KOLEO loss (non-distributed)
-    - DINO, IBOT, and KOLEO are always computed even if their weight is 0.0
+    Multi-student knowledge distillation meta-architecture.
+
+    Extends :class:`SSLMetaArch` to support training multiple student models
+    simultaneously from a shared teacher. Each student operates on a process
+    subgroup while teacher outputs are broadcast across subgroups.
+
+    This architecture enables efficient knowledge transfer to multiple students
+    of different sizes (e.g., ViT-S, ViT-B, ViT-L) in a single training run,
+    with the teacher providing consistent soft targets to all students.
+
+    Key Simplifications vs SSLMetaArch:
+    ----------------------------------
+    - **Fixed loss scales**: DINO, KoLeo, and iBOT losses use baked-in weights
+    - **Always global + local crops**: No option to disable either crop type
+    - **Separate heads**: Always uses separate DINO and iBOT heads
+    - **Sinkhorn-Knopp centering**: Always used for teacher soft targets
+    - **Per-GPU KoLeo**: Non-distributed computation for efficiency
+    - **No Gram loss**: Gram anchoring is not used in distillation
+
+    Attributes:
+    ----------
+    Inherits all attributes from :class:`SSLMetaArch`.
+
+    Note:
+    ----
+    The teacher model processes crops at full resolution, then broadcasts
+    features to student subgroups. Students may operate at lower resolution
+    (controlled by ``crops.teacher_to_student_resolution_scale``).
     """
 
     def forward_backward(
-        self, data, *, teacher_temp, iteration: int = 0, **ignored_kwargs
+        self,
+        data: dict[str, Tensor],
+        *,
+        teacher_temp: float,
+        iteration: int = 0,
+        **ignored_kwargs,
     ) -> tuple[Tensor, dict[str, float | Tensor]]:
+        """
+        Execute forward pass, loss computation, and backward pass.
+
+        This method orchestrates the multi-distillation training step:
+
+        1. Extract crops and masks from data batch
+        2. Optionally downsample crops for student resolution
+        3. Broadcast teacher outputs to student subgroups
+        4. Compute student outputs on subgroup-local data
+        5. Compute DINO, iBOT, and KoLeo losses
+        6. Backpropagate gradients
+
+        Parameters:
+        ----------
+        data : dict[str, Tensor]
+            Batch dictionary containing:
+
+            - ``collated_global_crops``: [2*B, C, H, W] global crop images
+            - ``collated_local_crops``: [n_local*B, C, h, w] local crop images
+            - ``collated_masks``: [2*B, P] boolean masks for iBOT
+            - ``mask_indices_list``: Indices of masked patches
+            - ``masks_weight``: Per-mask loss weights
+            - ``n_masked_patches``: Count of masked patches per image
+            - ``global_batch_size``: Total batch size across all ranks
+            - ``upperbound``: Upper bound for masked patch indices
+
+        teacher_temp : float
+            Temperature for teacher softmax (controls sharpness of soft targets).
+
+        iteration : int, default=0
+            Current training iteration (used for scheduling).
+
+        **ignored_kwargs
+            Additional kwargs are ignored (for API compatibility).
+
+        Returns:
+        -------
+        tuple[Tensor, dict[str, float | Tensor]]
+            - Total weighted loss scalar for logging
+            - Dictionary of loss components and metrics:
+              - ``batch_size``: Local batch size
+              - ``dino_local_crops_loss``: DINO loss on local crops
+              - ``dino_global_crops_loss``: DINO loss on global crops
+              - ``ibot_loss``: iBOT masked patch prediction loss
+              - ``koleo_loss``: KoLeo uniformity loss
+        """
         del ignored_kwargs
         metrics_dict = {}
 
@@ -108,14 +268,62 @@ class MultiDistillationMetaArch(SSLMetaArch):
     @torch.no_grad()
     def get_teacher_output(
         self,
-        images,
+        images: Tensor,
         *,
-        upperbound,
-        mask_indices_list,
-        teacher_temp,
-        n_masked_patches_tensor,
-        global_batch_size,
-    ):
+        upperbound: int,
+        mask_indices_list: Tensor,
+        teacher_temp: float,
+        n_masked_patches_tensor: Tensor,
+        global_batch_size: int,
+    ) -> dict[str, Tensor]:
+        """
+        Compute teacher outputs and broadcast to student subgroups.
+
+        This method extends the base class to support multi-distillation by:
+
+        1. Computing teacher backbone features on full-resolution crops
+        2. Broadcasting intermediate features to all student subgroups
+        3. Completing head computations after broadcast (for efficiency)
+        4. Applying Sinkhorn-Knopp centering for soft targets
+
+        The two-stage head computation (before and after broadcast) reduces
+        communication overhead by broadcasting lower-dimensional intermediate
+        representations instead of final outputs.
+
+        Parameters:
+        ----------
+        images : Tensor
+            Global crop images, shape [n_crops, B_teacher, C, H, W].
+
+        upperbound : int
+            Upper bound for valid indices in mask_indices_list.
+
+        mask_indices_list : Tensor
+            Flattened indices of masked patches for iBOT loss.
+
+        teacher_temp : float
+            Temperature for Sinkhorn-Knopp soft target normalization.
+
+        n_masked_patches_tensor : Tensor
+            Number of masked patches per image (for weighted averaging).
+
+        global_batch_size : int
+            Total batch size across all ranks (for broadcast sizing).
+
+        Returns:
+        -------
+        dict[str, Tensor]
+            Teacher output dictionary containing:
+
+            - ``cls_after_head``: [n_crops, B, K] CLS token logits
+            - ``cls_centered``: [n_crops, B, K] Sinkhorn-Knopp centered CLS
+            - ``masked_patch_centered``: [n_masked, K] Centered masked patch logits
+
+        Note:
+        ----
+        This method is decorated with ``@torch.no_grad()`` since teacher
+        parameters are frozen and we only need forward computation.
+        """
         n_crops, B_teacher, rgb, H, W = images.shape
 
         backbone_out = self.teacher.backbone(images.flatten(0, 1), is_training=True)
