@@ -228,6 +228,16 @@ class ConvNeXt(nn.Module):
                 x = self.downsample_layers[i](x)
                 x = self.stages[i](x)
             x_pool = x.mean([-2, -1])  # global average pooling, (N, C, H, W) -> (N, C)
+            
+            # Resize feature maps to match ViT-like patch token count if patch_size is specified
+            if self.patch_size is not None:
+                x = nn.functional.interpolate(
+                    x,
+                    size=(h // self.patch_size, w // self.patch_size),
+                    mode="bilinear",
+                    antialias=True,
+                )
+            
             x = torch.flatten(x, 2).transpose(1, 2)
 
             # concat [CLS] and patch tokens as (N, HW + 1, C), then normalize
